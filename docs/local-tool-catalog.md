@@ -46,13 +46,32 @@ Results can match only some query words. Use short capability terms.
 `list --json` returns full entries, including paths, descriptions, and sources.
 Both use the same cache and automatic refresh as search.
 
-Set `"jev": {"enabled": true}` in `~/.local/share/tool-catalog/config.json` to
+Run `tool-catalog configure --jev` for one-time setup. It prompts for the key
+with hidden input and enables Jev. If `TYPESAFE_API_KEY` exists in the environment,
+setup saves that value without prompting. Setup refuses input when it cannot hide it.
+
+The key stays in `~/.config/tool-catalog/credentials.json`, separate from settings
+and catalog data. The directory has mode `0700`; the file has mode `0600`.
+The file contains plaintext. Do not commit or share it.
+Repeat setup to replace the key. Delete this credentials file to remove the saved key.
+
+Search uses `TYPESAFE_API_KEY` from the environment first, then the credentials file.
+Normal commands need no wrapper:
+
+```sh
+tool-catalog configure --jev
+tool-catalog search "query metrics" --limit 5
+```
+
+Alternatively, set `"jev": {"enabled": true}` in `~/.local/share/tool-catalog/config.json` to
 use Jev on every search. `--jev` enables it for one command. `--no-jev` overrides
-the config for one command. Jev uses `TYPESAFE_API_KEY`, `TYPESAFE_ENDPOINT` when
+the config for one command. Jev uses the resolved key, `TYPESAFE_ENDPOINT` when
 set, and `jev-latest` unless `TYPESAFE_MODEL` overrides it. Missing keys, timeouts,
 and API errors return lexical results. Jev reranks up to 12 lexical candidates by
 default, then returns the requested limit. Set `jev.candidate_limit` to change
 the shortlist, up to 50. The default configuration remains local.
+Unreadable, invalid, or overly permissive credentials also return lexical results.
+Jev sends the query and shortlisted command names, descriptions, and cached help to TypeSafe.
 
 `inspect` returns the selected command, sources, and help output. It runs only
 `NAME --help`, `NAME help`, or `NAME -h`, without a shell or user arguments.

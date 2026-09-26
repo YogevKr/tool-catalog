@@ -3,16 +3,19 @@
 
 import argparse
 import collections
+import getpass
 import gzip
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess  # nosec B404: only fixed Homebrew metadata command below
 import tempfile
 import time
 import urllib.error
 import urllib.request
+import warnings
 from pathlib import Path
 
 STATE = Path.home() / ".local/share/tool-catalog"
@@ -349,6 +352,59 @@ def load_config(state):
         return {}
 
 
+def credentials_path():
+    return Path.home() / ".config/tool-catalog/credentials.json"
+
+
+def load_api_key():
+    key = os.environ.get("TYPESAFE_API_KEY")
+    if key:
+        return key
+    path = credentials_path()
+    if not path.exists():
+        return ""
+    for location in (path.parent, path):
+        info = location.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_mode & 0o077:
+            raise ValueError("Credentials require a private directory and file.")
+    with path.open() as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict) or not isinstance(data.get("TYPESAFE_API_KEY"), str):
+        raise ValueError("Invalid credentials format.")
+    return data["TYPESAFE_API_KEY"].strip()
+
+
+def configure_jev(state):
+    config_path = state / "config.json"
+    config = (
+        json.loads(read_text(config_path)) if config_path.exists() else default_config()
+    )
+    if not isinstance(config, dict) or not isinstance(config.get("jev", {}), dict):
+        raise ValueError("Invalid configuration format.")
+    key = os.environ.get("TYPESAFE_API_KEY")
+    if not key:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                key = getpass.getpass("TypeSafe API key (hidden): ")
+        except (getpass.GetPassWarning, EOFError, KeyboardInterrupt):
+            raise ValueError(
+                "Key entry cancelled or hidden input unavailable."
+            ) from None
+    key = key.strip()
+    if not key:
+        raise ValueError("The API key must not be empty.")
+    path = credentials_path()
+    if path.parent.is_symlink() or path.is_symlink():
+        raise ValueError("Credentials paths must not be symbolic links.")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    write_json(path, {"TYPESAFE_API_KEY": key})
+    config.setdefault("jev", {})["enabled"] = True
+    write_json(config_path, config)
+    print(f"Saved credentials to {path}. Jev is enabled for searches.")
+
+
 def tokens(text):
     values = set()
     for value in re.findall(r"[a-z0-9]+", text.lower()):
@@ -370,9 +426,18 @@ def expanded_terms(text):
 def jev_rerank(query, entries, timeout=8, settings=None):
     """Optionally rerank a lexical shortlist with a TypeSafe Noul judgment."""
     settings = settings or {}
-    api_key = os.environ.get("TYPESAFE_API_KEY")
+    try:
+        api_key = load_api_key()
+    except (OSError, ValueError):
+        return (
+            entries,
+            "Jev skipped: credentials unavailable; run tool-catalog configure --jev.",
+        )
     if not api_key:
-        return entries, "Jev skipped: TYPESAFE_API_KEY is not set."
+        return (
+            entries,
+            "Jev skipped: API key is not set; run tool-catalog configure --jev.",
+        )
     endpoint = settings.get(
         "endpoint",
         os.environ.get("TYPESAFE_ENDPOINT", "https://api.typesafe.ai/v1/systemone"),
@@ -412,9 +477,7 @@ def jev_rerank(query, entries, timeout=8, settings=None):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(
-                request, timeout=timeout
-            ) as response:  # nosec B310: endpoint is explicit or user-configured
+            with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310: endpoint is explicit or user-configured
                 body = json.loads(response.read(MAX_TEXT).decode("utf-8"))
             score = float(body["answers"]["relevant"]["noul"])
         except (OSError, urllib.error.URLError, ValueError, KeyError, TypeError):
@@ -451,6 +514,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, default=STATE)
     sub = parser.add_subparsers(dest="command", required=True)
+    configure = sub.add_parser("configure", help="Store credentials and enable Jev")
+    configure.add_argument("--jev", action="store_true", required=True)
     sub.add_parser(
         "refresh", help="Rebuild metadata without executing discovered commands"
     )
@@ -485,6 +550,9 @@ def main():
     show.add_argument("name")
     args = parser.parse_args()
     try:
+        if args.command == "configure":
+            configure_jev(args.state_dir)
+            return
         config = load_config(args.state_dir)
         catalog = (
             refresh(args.state_dir)

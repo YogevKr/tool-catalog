@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import plistlib
@@ -27,6 +28,12 @@ class CatalogTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        self.credentials = self.root / "config/tool-catalog/credentials.json"
+        self.enterContext(
+            mock.patch.object(
+                catalog, "credentials_path", return_value=self.credentials
+            )
+        )
 
     def executable(self, relative, text="#!/bin/sh\n# Custom test command\nexit 91\n"):
         path = self.root / relative
@@ -192,6 +199,117 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(result, entries)
         self.assertIn("not set", message)
 
+    def test_configure_stores_private_key_and_preserves_settings(self):
+        state = self.root / "state"
+        catalog.write_json(
+            state / "config.json", {"paths": ["/tools"], "jev": {"timeout": 3}}
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(catalog.getpass, "getpass", return_value="test-secret"),
+            mock.patch("sys.stdout", output),
+        ):
+            catalog.configure_jev(state)
+            self.assertEqual(catalog.load_api_key(), "test-secret")
+        self.assertEqual(self.credentials.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.credentials.parent.stat().st_mode & 0o777, 0o700)
+        config = catalog.load_config(state)
+        self.assertEqual(
+            config, {"paths": ["/tools"], "jev": {"timeout": 3, "enabled": True}}
+        )
+        self.assertNotIn("test-secret", output.getvalue())
+        self.assertNotIn("test-secret", (state / "config.json").read_text())
+
+    def test_environment_key_overrides_file_without_reading_it(self):
+        with (
+            mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "env-key"}),
+            mock.patch.object(
+                catalog,
+                "credentials_path",
+                side_effect=AssertionError("must not read file"),
+            ),
+        ):
+            self.assertEqual(catalog.load_api_key(), "env-key")
+
+    def test_configure_uses_environment_key_without_prompt_or_scan(self):
+        state = self.root / "state"
+        with (
+            mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "env-key"}),
+            mock.patch.object(
+                catalog.getpass,
+                "getpass",
+                side_effect=AssertionError("must not prompt"),
+            ),
+            mock.patch.object(
+                catalog, "load_catalog", side_effect=AssertionError("must not scan")
+            ),
+            mock.patch(
+                "sys.argv",
+                ["tool-catalog", "--state-dir", str(state), "configure", "--jev"],
+            ),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            catalog.main()
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(catalog.load_api_key(), "env-key")
+        self.assertIn("paths", catalog.load_config(state))
+
+    def test_configure_rejects_empty_or_visible_input_without_writes(self):
+        for result in (
+            "  ",
+            EOFError(),
+            KeyboardInterrupt(),
+            catalog.getpass.GetPassWarning(),
+        ):
+            with self.subTest(result=type(result).__name__):
+                with (
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch.object(
+                        catalog.getpass,
+                        "getpass",
+                        **(
+                            {"return_value": result}
+                            if isinstance(result, str)
+                            else {"side_effect": result}
+                        ),
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    catalog.configure_jev(self.root / "state")
+                self.assertFalse(self.credentials.exists())
+                self.assertFalse((self.root / "state/config.json").exists())
+
+    def test_bad_credentials_fall_back_without_secret_in_message(self):
+        self.credentials.parent.mkdir(parents=True, mode=0o700)
+        entries = [{"name": "tool"}]
+        for contents, mode in [
+            ("test-secret", 0o600),
+            ("[]", 0o600),
+            ('{"TYPESAFE_API_KEY": 123}', 0o600),
+            ('{"TYPESAFE_API_KEY": "test-secret"}', 0o644),
+        ]:
+            with self.subTest(contents=contents, mode=mode):
+                self.credentials.write_text(contents)
+                self.credentials.chmod(mode)
+                with mock.patch.dict(os.environ, {}, clear=True):
+                    result, message = catalog.jev_rerank("metrics", entries)
+                self.assertEqual(result, entries)
+                self.assertIn("credentials unavailable", message)
+                self.assertNotIn("test-secret", message)
+
+    def test_configure_refuses_symlink_without_changing_target(self):
+        target = self.root / "existing"
+        target.write_text("existing content")
+        self.credentials.parent.mkdir(parents=True)
+        self.credentials.symlink_to(target)
+        with (
+            mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "test-key"}),
+            self.assertRaises(ValueError),
+        ):
+            catalog.configure_jev(self.root / "state")
+        self.assertEqual(target.read_text(), "existing content")
+
     def test_config_enables_jev_without_a_cli_flag(self):
         state = self.root / "state"
         catalog.write_json(state / "config.json", {"jev": {"enabled": True}})
@@ -222,13 +340,16 @@ class CatalogTests(unittest.TestCase):
                 Response({"answers": {"relevant": {"noul": 0.9}}}),
             ]
         )
-        with mock.patch.dict(
-            os.environ, {"TYPESAFE_API_KEY": "test-key"}, clear=True
-        ), mock.patch.object(
-            urllib.request,
-            "urlopen",
-            side_effect=lambda *args, **kwargs: next(responses),
-        ) as urlopen:
+        self.credentials.parent.mkdir(parents=True, mode=0o700)
+        catalog.write_json(self.credentials, {"TYPESAFE_API_KEY": "test-key"})
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(
+                urllib.request,
+                "urlopen",
+                side_effect=lambda *args, **kwargs: next(responses),
+            ) as urlopen,
+        ):
             result, message = catalog.jev_rerank("metrics", entries)
         self.assertEqual([item["name"] for item in result], ["a", "b"])
         self.assertEqual(result[0]["jev_score"], 0.9)
@@ -304,10 +425,10 @@ class InstallTests(unittest.TestCase):
 
     def test_installs_skill_and_hourly_job_with_explicit_paths(self):
         (self.home / ".claude").mkdir()
-        with mock.patch.object(
-            catalog, "refresh", return_value={"tools": []}
-        ), mock.patch.object(installer.subprocess, "run") as run, mock.patch.object(
-            installer.sys, "platform", "darwin"
+        with (
+            mock.patch.object(catalog, "refresh", return_value={"tools": []}),
+            mock.patch.object(installer.subprocess, "run") as run,
+            mock.patch.object(installer.sys, "platform", "darwin"),
         ):
             installer.install(self.home, schedule=True)
         binary = self.home / ".local/bin/tool-catalog"
@@ -335,9 +456,10 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((self.home / ".local/share/tool-catalog").exists())
 
     def test_without_schedule_never_calls_launchctl(self):
-        with mock.patch.object(
-            catalog, "refresh", return_value={"tools": []}
-        ), mock.patch.object(installer.subprocess, "run") as run:
+        with (
+            mock.patch.object(catalog, "refresh", return_value={"tools": []}),
+            mock.patch.object(installer.subprocess, "run") as run,
+        ):
             installer.install(self.home, schedule=False)
         run.assert_not_called()
         self.assertFalse((self.home / "Library/LaunchAgents").exists())
