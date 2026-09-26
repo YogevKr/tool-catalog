@@ -1,0 +1,569 @@
+#!/usr/bin/env python3
+"""Discover installed commands and search their local documentation."""
+
+import argparse
+import collections
+import gzip
+import json
+import os
+import re
+import shutil
+import subprocess  # nosec B404: only fixed Homebrew metadata command below
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+STATE = Path.home() / ".local/share/tool-catalog"
+MAX_TEXT = 131072
+MAX_HELP = 24576
+HELP_TIMEOUT = 5
+STOP_WORDS = set(
+    "a an and any can do find for from i in me my of on please the to tool tools use with".split()
+)
+TERM_ALIASES = {
+    "applications": {"application", "app", "service"},
+    "apps": {"app", "application", "service"},
+    "dashboards": {"dashboard", "grafana", "visualization"},
+    "error": {"error", "failure", "issue", "problem"},
+    "errors": {"error", "failure", "issue", "problem"},
+    "inspect": {"inspect", "examine", "diagnose", "triage", "debug"},
+    "log": {"logs", "logging", "events"},
+    "logs": {"log", "logging", "events"},
+    "metric": {"metric", "metrics", "promql", "monitoring", "telemetry", "grafana"},
+    "metrics": {"metric", "metrics", "promql", "monitoring", "telemetry", "grafana"},
+    "queries": {"query", "search", "lookup", "inspect"},
+    "trace": {"trace", "tracing", "spans", "telemetry"},
+    "traces": {"trace", "tracing", "spans", "telemetry"},
+    "kubernetes": {"k8s", "kubectl", "cluster", "pod", "pods"},
+    "k8s": {"kubernetes", "kubectl", "cluster", "pod", "pods"},
+    "cluster": {"kubernetes", "k8s", "kubectl"},
+    "pod": {"pods", "kubernetes", "k8s", "kubectl", "container", "containers"},
+    "pods": {"pod", "kubernetes", "k8s", "kubectl", "container", "containers"},
+    "container": {"containers", "kubernetes", "k8s", "kubectl", "pod", "pods"},
+    "containers": {"container", "kubernetes", "k8s", "kubectl", "pod", "pods"},
+    "worktree": {"worktree", "git", "branch"},
+    "worktrees": {"worktree", "git", "branch"},
+}
+
+
+def read_text(path):
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as stream:
+        return stream.read(MAX_TEXT)
+
+
+def clean(text):
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+    return " ".join(text.split())[:1800]
+
+
+def clean_help(text):
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+    return text.replace("\x00", "")[:MAX_HELP].strip()
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        json.dump(value, stream, indent=2)
+        stream.write("\n")
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def scan(directories, warnings):
+    commands = collections.defaultdict(list)
+    for directory in dict.fromkeys(directories):
+        root = Path(directory).expanduser()
+        if not root.is_absolute():
+            continue
+        try:
+            entries = sorted(root.iterdir())
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            warnings.append(f"Cannot scan {root}: {error}")
+            continue
+        for path in entries:
+            if path.is_file() and os.access(path, os.X_OK):
+                commands[path.name].append(str(path))
+    return commands
+
+
+def brew_metadata(warnings):
+    brew = shutil.which("brew")
+    if not brew:
+        return {}
+    try:
+        result = subprocess.run(  # nosec B603: fixed metadata command, no shell
+            [brew, "info", "--json=v2", "--installed"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+            env={**os.environ, "HOMEBREW_NO_AUTO_UPDATE": "1"},
+        )
+        formulae = json.loads(result.stdout)["formulae"]
+        return {f["name"]: f.get("desc") or "" for f in formulae}
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
+        warnings.append(f"Homebrew metadata unavailable: {error}")
+        return {}
+
+
+def skill_metadata(roots, warnings):
+    descriptions = []
+    seen = set()
+    for root in roots:
+        for path in sorted(Path(root).expanduser().glob("*/SKILL.md")):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            try:
+                text = read_text(path)
+            except OSError as error:
+                warnings.append(f"Cannot read skill {path}: {error}")
+                continue
+            match = re.search(r"(?ms)^description:\s*(.*?)(?=^\S|\Z)", text)
+            if match:
+                description = clean(match[1].lstrip(">|- \n").strip("\"'"))
+                descriptions.append((path.parent.name, description, str(path)))
+    return descriptions
+
+
+def manual_description(path):
+    text = read_text(path)
+    nd = re.search(r"(?m)^\.Nd\s+(.+)", text)
+    if nd:
+        return clean(nd[1])
+    section = re.search(r'(?is)\.SH\s+"?NAME"?\s*\n(.*?)(?=\n\.SH|\Z)', text)
+    if not section:
+        return ""
+    text = re.sub(r"(?m)^\.[A-Za-z]+\s*", "", section[1])
+    text = re.sub(r"\\f(?:\[[^]]*\]|.)", "", text)
+    return clean(text.replace(r"\-", "-").replace(r"\&", ""))
+
+
+def script_description(target):
+    with target.open("rb") as stream:
+        head = stream.read(MAX_TEXT)
+    if not head.startswith(b"#!") or b"\0" in head:
+        return ""
+    text = head.decode("utf-8", errors="replace")
+    patterns = [
+        r'\A#![^\n]*\n\s*(?:"""|\'\'\')(.*?)(?:"""|\'\'\')',
+        r"(?m)^Usage:[^\n]*\n\s*\n([^\n]+)",
+        r"""ArgumentParser\(\s*description\s*=\s*["']([^"']+)""",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.S)
+        if match:
+            return clean(match[1])
+    comments = re.match(r"\A#![^\n]*\n\s*((?:#[^\n]*\n)+)", text)
+    return clean(re.sub(r"(?m)^#\s?", "", comments[1])) if comments else ""
+
+
+def local_description(target):
+    """Read descriptions, never import packages or execute discovered programs."""
+    text = script_description(target)
+    if text:
+        return text, str(target)
+    for parent in list(target.parents)[:4]:
+        package = parent / "package.json"
+        if package.is_file():
+            description = json.loads(read_text(package)).get("description", "")
+            if description:
+                return clean(description), str(package)
+        if (parent / ".git").exists():
+            readme = parent / "README.md"
+            if readme.is_file():
+                paragraphs = re.split(r"\n\s*\n", read_text(readme))
+                prose = next((p for p in paragraphs if re.match(r"^[A-Za-z]", p)), "")
+                return clean(prose), str(readme)
+            break
+    return "", ""
+
+
+def manual_documents(name, roots, warnings):
+    documents = []
+    for root in roots:
+        for suffix in (".1", ".1.gz", ".8", ".8.gz"):
+            path = Path(root) / ("man" + suffix[1]) / (name + suffix)
+            if not path.is_file():
+                continue
+            try:
+                text = manual_description(path)
+                if text:
+                    documents.append({"text": text, "source": str(path)})
+            except (OSError, EOFError) as error:
+                warnings.append(f"Cannot read manual {path}: {error}")
+    return documents
+
+
+def describe(name, paths, sources, warnings):
+    target = Path(paths[0]).resolve()
+    documents = []
+    formulae, skills, man_roots = sources
+    parts = target.parts
+    if "Cellar" in parts:
+        formula = parts[parts.index("Cellar") + 1]
+        if formulae.get(formula):
+            documents.append({"text": formulae[formula], "source": f"brew:{formula}"})
+    for skill_name, text, path in skills:
+        if skill_name == name or skill_name.startswith(name + "-"):
+            documents.append({"text": text, "source": path})
+    documents.extend(manual_documents(name, man_roots, warnings))
+    if not documents:
+        try:
+            text, source = local_description(target)
+            if text:
+                documents.append({"text": text, "source": source})
+        except (OSError, ValueError) as error:
+            warnings.append(f"Cannot read description for {name}: {error}")
+    return {
+        "name": name,
+        "path": paths[0],
+        "resolved_path": str(target),
+        "other_paths": paths[1:],
+        "description": (
+            documents[0]["text"] if documents else "No local description found."
+        ),
+        "documents": documents,
+    }
+
+
+def capture_help(entry, timeout=HELP_TIMEOUT, cwd=None):
+    """Capture a bounded help response without invoking a shell or user arguments."""
+    command = entry["resolved_path"]
+    if not Path(command).is_file() or not os.access(command, os.X_OK):
+        return "", "unavailable"
+    for flag in ("--help", "help", "-h"):
+        try:
+            result = subprocess.run(  # nosec B603: fixed executable and help flags only
+                [command, flag],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                cwd=str(cwd or Path.cwd()),
+                env={"PATH": os.environ.get("PATH", ""), "HOME": str(Path.home())},
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        output = clean_help(
+            "\n".join(part for part in (result.stdout, result.stderr) if part)
+        )
+        if output:
+            return output, flag
+    return "", "unavailable"
+
+
+def inspect_tool(catalog, name, state, force=False, cwd=None):
+    entry = next((tool for tool in catalog["tools"] if tool["name"] == name), None)
+    if entry is None:
+        return None
+    help_cwd = str(cwd or Path.cwd())
+    if force or not entry.get("help") or entry.get("help_cwd") != help_cwd:
+        help_text, help_flag = capture_help(entry, cwd=cwd)
+        entry["help"] = help_text
+        entry["help_flag"] = help_flag
+        entry["help_cwd"] = help_cwd
+        entry["help_captured_at"] = time.time()
+        write_json(state / "catalog.json", catalog)
+    return entry
+
+
+def default_config():
+    home = Path.home()
+    path = [
+        p
+        for p in os.environ.get("PATH", "").split(os.pathsep)
+        if p and "/.codex/tmp/" not in p
+    ]
+    return {
+        "paths": path,
+        "extra_paths": [
+            str(home / p) for p in (".local/bin", "bin", "go/bin", ".cargo/bin")
+        ]
+        + ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"],
+        "skill_roots": [
+            str(home / p) for p in (".agents/skills", ".codex/skills", ".claude/skills")
+        ],
+        "man_roots": [
+            "/usr/share/man",
+            "/usr/local/share/man",
+            "/opt/homebrew/share/man",
+            str(home / ".local/share/man"),
+        ],
+    }
+
+
+def refresh(state):
+    config_path = state / "config.json"
+    config = (
+        json.loads(read_text(config_path)) if config_path.exists() else default_config()
+    )
+    warnings = []
+    commands = scan(config["paths"] + config["extra_paths"], warnings)
+    sources = (
+        brew_metadata(warnings),
+        skill_metadata(config["skill_roots"], warnings),
+        config["man_roots"],
+    )
+    entries = [
+        describe(name, paths, sources, warnings)
+        for name, paths in sorted(commands.items())
+    ]
+    catalog = {
+        "version": 1,
+        "updated_at": time.time(),
+        "tools": entries,
+        "warnings": warnings,
+    }
+    write_json(state / "catalog.json", catalog)
+    return catalog
+
+
+def load_catalog(state):
+    path = state / "catalog.json"
+    if not path.exists() or time.time() - path.stat().st_mtime > 3600:
+        return refresh(state)
+    with path.open() as stream:
+        return json.load(stream)
+
+
+def load_config(state):
+    path = state / "config.json"
+    if not path.exists():
+        return {}
+    try:
+        with path.open() as stream:
+            config = json.load(stream)
+        return config if isinstance(config, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def tokens(text):
+    values = set()
+    for value in re.findall(r"[a-z0-9]+", text.lower()):
+        if value in STOP_WORDS:
+            continue
+        values.add(
+            value.rstrip("s") if len(value) > 4 and value.endswith("s") else value
+        )
+    return values
+
+
+def expanded_terms(text):
+    terms = tokens(text)
+    for term in tuple(terms):
+        terms.update(TERM_ALIASES.get(term, ()))
+    return terms
+
+
+def jev_rerank(query, entries, timeout=8, settings=None):
+    """Optionally rerank a lexical shortlist with a TypeSafe Noul judgment."""
+    settings = settings or {}
+    api_key = os.environ.get("TYPESAFE_API_KEY")
+    if not api_key:
+        return entries, "Jev skipped: TYPESAFE_API_KEY is not set."
+    endpoint = settings.get(
+        "endpoint",
+        os.environ.get("TYPESAFE_ENDPOINT", "https://api.typesafe.ai/v1/systemone"),
+    )
+    model = settings.get("model", os.environ.get("TYPESAFE_MODEL", "jev-latest"))
+    scored = []
+    for entry in entries:
+        state = {
+            "query": query,
+            "candidate": {
+                "name": entry["name"],
+                "description": entry["description"],
+                "help": entry.get("help", "")[:4000],
+            },
+        }
+        payload = {
+            "state": state,
+            "model": model,
+            "questions": {
+                "relevant": {
+                    "type": "noul",
+                    "instructions": "Does this installed command help complete the user's request?",
+                    "criteria": {
+                        "true": "The command directly supports the requested task or is a strong practical match.",
+                        "false": "The command is unrelated, too general, or only shares a broad word.",
+                    },
+                }
+            },
+        }
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=timeout
+            ) as response:  # nosec B310: endpoint is explicit or user-configured
+                body = json.loads(response.read(MAX_TEXT).decode("utf-8"))
+            score = float(body["answers"]["relevant"]["noul"])
+        except (OSError, urllib.error.URLError, ValueError, KeyError, TypeError):
+            return entries, "Jev failed; lexical ranking used."
+        copy = dict(entry)
+        copy["jev_score"] = score
+        scored.append((score, copy))
+    scored.sort(key=lambda item: (-item[0], item[1]["name"]))
+    return [entry for _, entry in scored], f"Jev reranked {len(scored)} candidates."
+
+
+def search(catalog, query, limit):
+    terms = expanded_terms(query)
+    ranked = []
+    for entry in catalog["tools"]:
+        name_terms = tokens(entry["name"])
+        description_terms = tokens(entry["description"])
+        document_terms = tokens(" ".join(d["text"] for d in entry["documents"]))
+        matched = terms & (name_terms | description_terms | document_terms)
+        if not matched:
+            continue
+        score = 10 * len(terms & name_terms) + 4 * len(terms & description_terms)
+        score += len(matched) + 2 * len(terms & tokens(entry.get("help", "")))
+        score += 20 * (entry["name"].lower() == query.lower())
+        score += 10 * bool(tokens(query) <= matched)
+        score += 3 * bool(entry["documents"])
+        if Path(entry["path"]).is_file() and os.access(entry["path"], os.X_OK):
+            ranked.append((score, entry))
+    ranked.sort(key=lambda pair: (-pair[0], pair[1]["name"]))
+    return [entry for _, entry in ranked[:limit]]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-dir", type=Path, default=STATE)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser(
+        "refresh", help="Rebuild metadata without executing discovered commands"
+    )
+    sub.add_parser("status", help="Show catalog age, coverage, and warnings")
+    listing = sub.add_parser("list", help="List all indexed commands alphabetically")
+    listing.add_argument(
+        "--json", action="store_true", help="Include paths and descriptions"
+    )
+    find = sub.add_parser("search", help="Search names and local descriptions")
+    find.add_argument("query", nargs="+")
+    find.add_argument("--limit", type=int, default=8)
+    find.add_argument("--json", action="store_true")
+    jev = find.add_mutually_exclusive_group()
+    jev.add_argument(
+        "--jev", dest="jev", action="store_true", help="Enable Jev semantic reranking"
+    )
+    jev.add_argument(
+        "--no-jev",
+        dest="jev",
+        action="store_false",
+        help="Disable configured Jev reranking",
+    )
+    find.set_defaults(jev=None)
+    inspect = sub.add_parser("inspect", help="Show a command and cached help output")
+    inspect.add_argument("name")
+    inspect.add_argument("--refresh", action="store_true", help="Capture help again")
+    inspect.add_argument(
+        "--cwd", type=Path, default=Path.cwd(), help="Directory for help capture"
+    )
+    inspect.add_argument("--json", action="store_true")
+    show = sub.add_parser("show", help="Show paths, documentation, and sources")
+    show.add_argument("name")
+    args = parser.parse_args()
+    try:
+        config = load_config(args.state_dir)
+        catalog = (
+            refresh(args.state_dir)
+            if args.command == "refresh"
+            else load_catalog(args.state_dir)
+        )
+        if args.command in ("refresh", "status"):
+            output = {
+                "commands": len(catalog["tools"]),
+                "described": sum(bool(t["documents"]) for t in catalog["tools"]),
+                "age_seconds": round(time.time() - catalog["updated_at"]),
+                "catalog": str(args.state_dir / "catalog.json"),
+                "warnings": catalog["warnings"],
+            }
+        elif args.command == "list":
+            output = sorted(catalog["tools"], key=lambda entry: entry["name"])
+            if not args.json:
+                for entry in output:
+                    print(entry["name"])
+                return
+        elif args.command == "show":
+            output = next((t for t in catalog["tools"] if t["name"] == args.name), None)
+            if output is None:
+                parser.exit(1, f"Command not found in catalog: {args.name}\n")
+        elif args.command == "inspect":
+            output = inspect_tool(
+                catalog, args.name, args.state_dir, args.refresh, args.cwd
+            )
+            if output is None:
+                parser.exit(1, f"Command not found in catalog: {args.name}\n")
+            if not args.json:
+                print(f"{output['name']} — {output['description'][:240]}")
+                print(f"  path: {output['path']}")
+                print(f"  help flag: {output.get('help_flag', 'cached')}")
+                print("\n" + (output.get("help") or "No help output captured."))
+                return
+        else:
+            jev_message = ""
+            jev_config = config.get("jev", {})
+            use_jev = (
+                args.jev
+                if args.jev is not None
+                else bool(jev_config.get("enabled", False))
+            )
+            requested_limit = max(1, args.limit)
+            search_limit = requested_limit
+            if use_jev:
+                try:
+                    configured_limit = int(
+                        jev_config.get("candidate_limit", max(requested_limit, 12))
+                    )
+                except (TypeError, ValueError):
+                    configured_limit = max(requested_limit, 12)
+                search_limit = max(requested_limit, min(configured_limit, 50))
+            output = search(catalog, " ".join(args.query), search_limit)
+            if use_jev and output:
+                output, jev_message = jev_rerank(
+                    " ".join(args.query),
+                    output,
+                    timeout=float(jev_config.get("timeout", 8)),
+                    settings=jev_config,
+                )
+                output = output[:requested_limit]
+            if not args.json:
+                for entry in output:
+                    print(
+                        f"{entry['name']} — {entry['description'][:240]}\n  {entry['path']}"
+                    )
+                if not output:
+                    print(
+                        "No matching installed command. Try fewer words or run tool-catalog refresh."
+                    )
+                if jev_message:
+                    print(f"\n{jev_message}")
+                return
+        print(json.dumps(output, indent=2))
+    except (OSError, ValueError, KeyError) as error:
+        parser.exit(1, f"Catalog error: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
