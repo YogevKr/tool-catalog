@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess  # nosec B404: only fixed Homebrew metadata command below
 import tempfile
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -510,6 +511,49 @@ def search(catalog, query, limit):
     return [entry for _, entry in ranked[:limit]]
 
 
+def print_search_results(entries, jev_message=""):
+    if not entries:
+        print("No matching commands. Try fewer words or run tool-catalog refresh.")
+        return
+    width = min(shutil.get_terminal_size((100, 24)).columns, 120)
+    scored = any("jev_score" in entry for entry in entries)
+    name_width = max(7, max(len(entry["name"]) for entry in entries))
+    score_width = 7 if scored else 0
+    description_width = width - name_width - score_width - 2
+    compact = description_width < 25
+    ranking = "Jev" if scored else "Local"
+    noun = "result" if len(entries) == 1 else "results"
+    print(f"{len(entries)} {noun} · {ranking} ranking\n")
+    if not compact:
+        score_header = "  SCORE" if scored else ""
+        print(f"{'COMMAND':<{name_width}}{score_header}  DESCRIPTION")
+    for entry in entries:
+        name = entry["name"]
+        description = clean(entry["description"])
+        description = re.sub(r"^" + re.escape(name) + r"\s+[—–-]\s+", "", description)
+        score = (
+            f"  {entry['jev_score']:5.2f}"
+            if "jev_score" in entry
+            else " " * score_width
+        )
+        if compact:
+            print(f"{name}{score}")
+            print(
+                "  "
+                + textwrap.shorten(
+                    description, width=max(4, width - 2), placeholder="…"
+                )
+            )
+        else:
+            summary = textwrap.shorten(
+                description, width=description_width, placeholder="…"
+            )
+            print(f"{name:<{name_width}}{score}  {summary}")
+    if jev_message and not scored:
+        print(f"\n{jev_message}")
+    print("\nDetails: tool-catalog show <command>")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, default=STATE)
@@ -617,16 +661,7 @@ def main():
                 )
                 output = output[:requested_limit]
             if not args.json:
-                for entry in output:
-                    print(
-                        f"{entry['name']} — {entry['description'][:240]}\n  {entry['path']}"
-                    )
-                if not output:
-                    print(
-                        "No matching installed command. Try fewer words or run tool-catalog refresh."
-                    )
-                if jev_message:
-                    print(f"\n{jev_message}")
+                print_search_results(output, jev_message)
                 return
         print(json.dumps(output, indent=2))
     except (OSError, ValueError, KeyError) as error:

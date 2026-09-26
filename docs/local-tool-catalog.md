@@ -42,6 +42,10 @@ embeddings or an external service for lexical search.
 Exact command names rank first.
 Results can match only some query words. Use short capability terms.
 
+Human search output shows command names, Jev scores when available, and short descriptions.
+Rows fit the terminal width. Narrow terminals use stacked rows.
+Use `show NAME` for full descriptions and executable paths, or `--json` for structured results.
+
 `list` prints all indexed command names alphabetically, one per line.
 `list --json` returns full entries, including paths, descriptions, and sources.
 Both use the same cache and automatic refresh as search.
