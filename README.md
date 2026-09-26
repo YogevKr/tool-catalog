@@ -3,8 +3,8 @@
 Discover installed command line tools for coding agents on macOS.
 
 The catalog scans local PATH directories, Homebrew metadata, manual pages,
-agent skill descriptions, and cached command help. It refreshes through launchd.
-Agents search it with short capability phrases.
+agent skill descriptions, MCP client configs, and cached command help.
+It refreshes through launchd. Agents search it with short capability phrases.
 
 ```sh
 python3 scripts/install_tool_catalog.py

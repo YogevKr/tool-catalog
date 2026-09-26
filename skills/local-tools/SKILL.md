@@ -1,6 +1,6 @@
 ---
 name: local-tools
-description: Discover installed CLI tools on this Mac before selecting a tool, installing a package, or writing a replacement script. Search local command names and descriptions for capabilities such as Grafana, Datadog, PDF, GitHub, and custom developer tools.
+description: Discover installed CLI tools and configured MCP servers on this Mac before selecting a tool, installing a package, or writing a replacement script. Search local command names and descriptions for capabilities such as Grafana, Datadog, PDF, GitHub, and custom developer tools.
 ---
 
 # Local CLI discovery
@@ -29,8 +29,9 @@ Read the selected command's help before choosing flags. Normal task authorizatio
 still applies to execution. Discovery does not authorize installs or external writes.
 
 The catalog reads Homebrew metadata, manual pages, installed skill descriptions,
-script headers, embedded usage text, package descriptions, and nearby repository READMEs. It never runs
-discovered commands. Some custom binaries have no description; search their name.
+script headers, embedded usage text, package descriptions, nearby repository READMEs,
+and MCP client configuration. It never runs discovered commands or MCP servers.
+Some custom binaries have no description; search their name.
 
 ```sh
 tool-catalog list
@@ -39,7 +40,9 @@ tool-catalog status
 tool-catalog refresh
 ```
 
-`list` prints every indexed command name alphabetically. `list --json` includes full entries.
+`list` prints every indexed command and MCP server name alphabetically.
+MCP servers use the `mcp:NAME` selector and have a `[mcp]` suffix.
+`list --json` includes full entries.
 
 Set `"jev": {"enabled": true}` in `~/.local/share/tool-catalog/config.json` to
 use Jev on every search. `--jev` enables it for one command. `--no-jev` overrides

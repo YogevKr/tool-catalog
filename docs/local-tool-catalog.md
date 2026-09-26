@@ -46,7 +46,8 @@ Human search output shows command names, Jev scores when available, and short de
 Rows fit the terminal width. Narrow terminals use stacked rows.
 Use `show NAME` for full descriptions and executable paths, or `--json` for structured results.
 
-`list` prints all indexed command names alphabetically, one per line.
+`list` prints all indexed command and MCP server names alphabetically, one per line.
+MCP servers use the `mcp:NAME` selector and have a `[mcp]` suffix.
 `list --json` returns full entries, including paths, descriptions, and sources.
 Both use the same cache and automatic refresh as search.
 
@@ -85,14 +86,19 @@ the default. Help is recaptured when the directory changes.
 
 ## Sources and refresh
 
-Refresh scans the configured command directories in order. It preserves other
-paths for duplicate names and resolves symbolic links. Metadata comes from:
+Refresh scans the configured command directories and MCP client configs.
+It preserves other paths for duplicate command names and resolves symbolic links.
+Metadata comes from:
 
 - Homebrew's installed formula descriptions.
 - Manual page NAME sections in sections 1 and 8.
 - Installed skill descriptions whose names match a command or command prefix.
 - Script header comments, embedded usage text, and Python module descriptions.
 - Nearby package descriptions and repository README introductions.
+- MCP server names from Codex, Claude, Cursor, and OpenCode configuration files.
+
+MCP discovery reads configuration only. It does not start servers or store
+command arguments, URLs, environment values, or other server settings.
 
 Refresh never executes discovered commands. It runs the existing Homebrew CLI
 with automatic updates disabled. Commands without documentation remain searchable
@@ -100,11 +106,13 @@ by name. Aliases, shell functions, and arbitrary executables outside configured
 directories are outside this trial.
 
 `~/.local/share/tool-catalog/config.json` contains the captured PATH, extra paths,
-manual directories, and skill directories. Refresh detects additions, removals,
-and documentation changes in those locations. Add a path there if an installer
-introduces a new command directory. No list of individual tools is required.
+manual directories, skill directories, and MCP config paths. Refresh detects
+additions, removals, and documentation changes in those locations. Add a path
+there if an installer introduces a new command or MCP config directory.
+No list of individual tools is required.
 
-`catalog.json` stores the results and source paths. Refresh writes it atomically.
+`catalog.json` stores command results in `tools` and MCP results in
+`mcp_servers`. Refresh writes it atomically.
 `status` reports missing descriptions and source errors. Refresh logs use
 `refresh.log` and `refresh-error.log` in the same directory.
 Search refreshes a missing cache or a cache older than one hour.

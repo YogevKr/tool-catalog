@@ -8,6 +8,7 @@ import gzip
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess  # nosec B404: only fixed Homebrew metadata command below
@@ -18,6 +19,11 @@ import urllib.error
 import urllib.request
 import warnings
 from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - Python 3.10 and older
+    tomllib = None
 
 STATE = Path.home() / ".local/share/tool-catalog"
 MAX_TEXT = 131072
@@ -138,6 +144,135 @@ def skill_metadata(roots, warnings):
                 description = clean(match[1].lstrip(">|- \n").strip("\"'"))
                 descriptions.append((path.parent.name, description, str(path)))
     return descriptions
+
+
+def _mcp_configs(data, source, client, scope="global"):
+    """Return MCP server definitions from known client config shapes."""
+    if not isinstance(data, dict):
+        return []
+    found = []
+    for key in ("mcpServers", "mcp_servers", "mcp"):
+        servers = data.get(key)
+        if not isinstance(servers, dict):
+            continue
+        for name, config in servers.items():
+            if isinstance(name, str) and isinstance(config, dict):
+                found.append((name, config, source, client, scope))
+    projects = data.get("projects")
+    if isinstance(projects, dict):
+        for project, project_config in projects.items():
+            if not isinstance(project, str) or not isinstance(project_config, dict):
+                continue
+            found.extend(_mcp_configs(project_config, source, client, project))
+    return found
+
+
+def _mcp_client(path):
+    parts = Path(path).parts
+    if ".codex" in parts:
+        return "codex"
+    if ".claude.json" in parts:
+        return "claude"
+    if ".cursor" in parts:
+        return "cursor"
+    if "opencode" in parts:
+        return "opencode"
+    return "unknown"
+
+
+def _mcp_transport(config):
+    if isinstance(config.get("url"), str) or config.get("type") == "remote":
+        return "remote"
+    if isinstance(config.get("command"), (str, list)):
+        return "stdio"
+    return "unknown"
+
+
+def _mcp_command(config):
+    command = config.get("command")
+    if isinstance(command, list):
+        command = command[0] if command else ""
+    if not isinstance(command, str) or not command:
+        return ""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return ""
+    return Path(parts[0]).name if parts else ""
+
+
+def mcp_metadata(paths, warnings):
+    """Read configured MCP server names without executing or exposing config values."""
+    if not isinstance(paths, (list, tuple)):
+        warnings.append("MCP configuration paths must be a list")
+        return []
+    entries = {}
+    configured_paths = []
+    for configured_path in paths:
+        if not isinstance(configured_path, (str, os.PathLike)):
+            warnings.append("Skipping MCP config path that is not a string")
+            continue
+        configured_path = str(configured_path)
+        if configured_path not in configured_paths:
+            configured_paths.append(configured_path)
+    for configured_path in configured_paths:
+        path = Path(configured_path).expanduser()
+        if not path.is_file():
+            continue
+        try:
+            if path.suffix == ".toml":
+                if tomllib is None:
+                    warnings.append(f"Cannot read MCP config {path}: TOML is unavailable")
+                    continue
+                with path.open("rb") as stream:
+                    data = tomllib.load(stream)
+            else:
+                with path.open(encoding="utf-8", errors="replace") as stream:
+                    data = json.load(stream)
+        except (OSError, ValueError) as error:
+            warnings.append(f"Cannot read MCP config {path}: {error}")
+            continue
+        client = _mcp_client(path)
+        for name, config, source, source_client, scope in _mcp_configs(
+            data, str(path), client
+        ):
+            key = name
+            entry = entries.setdefault(
+                key,
+                {
+                    "name": name,
+                    "kind": "mcp",
+                    "path": source,
+                    "resolved_path": source,
+                    "other_paths": [],
+                    "description": f"MCP server {name}",
+                    "documents": [],
+                    "mcp": {"clients": [], "transports": [], "scopes": [], "commands": []},
+                },
+            )
+            if source not in [entry["path"], *entry["other_paths"]]:
+                entry["other_paths"].append(source)
+            details = entry["mcp"]
+            if source_client not in details["clients"]:
+                details["clients"].append(source_client)
+            transport = _mcp_transport(config)
+            if transport not in details["transports"]:
+                details["transports"].append(transport)
+            if scope not in details["scopes"]:
+                details["scopes"].append(scope)
+            command = _mcp_command(config)
+            if command and command not in details["commands"]:
+                details["commands"].append(command)
+            document = f"MCP server {name} configured for {source_client} ({transport})."
+            if scope != "global":
+                document += f" Scope: {scope}."
+            if not any(item["text"] == document and item["source"] == source for item in entry["documents"]):
+                entry["documents"].append({"text": document, "source": source})
+    for entry in entries.values():
+        clients = ", ".join(entry["mcp"]["clients"])
+        transports = ", ".join(entry["mcp"]["transports"])
+        entry["description"] = f"MCP server {entry['name']} ({transports}; configured for {clients})."
+    return sorted(entries.values(), key=lambda entry: entry["name"])
 
 
 def manual_description(path):
@@ -268,9 +403,11 @@ def capture_help(entry, timeout=HELP_TIMEOUT, cwd=None):
 
 
 def inspect_tool(catalog, name, state, force=False, cwd=None):
-    entry = next((tool for tool in catalog["tools"] if tool["name"] == name), None)
+    entry = find_catalog_entry(catalog, name)
     if entry is None:
         return None
+    if entry.get("kind") == "mcp":
+        return entry
     help_cwd = str(cwd or Path.cwd())
     if force or not entry.get("help") or entry.get("help_cwd") != help_cwd:
         help_text, help_flag = capture_help(entry, cwd=cwd)
@@ -304,6 +441,12 @@ def default_config():
             "/opt/homebrew/share/man",
             str(home / ".local/share/man"),
         ],
+        "mcp_configs": [
+            str(home / ".claude.json"),
+            str(home / ".cursor/mcp.json"),
+            str(home / ".codex/config.toml"),
+            str(home / ".config/opencode/opencode.json"),
+        ],
     }
 
 
@@ -323,10 +466,14 @@ def refresh(state):
         describe(name, paths, sources, warnings)
         for name, paths in sorted(commands.items())
     ]
+    mcp_servers = mcp_metadata(
+        config.get("mcp_configs", default_config()["mcp_configs"]), warnings
+    )
     catalog = {
-        "version": 1,
+        "version": 2,
         "updated_at": time.time(),
         "tools": entries,
+        "mcp_servers": mcp_servers,
         "warnings": warnings,
     }
     write_json(state / "catalog.json", catalog)
@@ -351,6 +498,28 @@ def load_config(state):
         return config if isinstance(config, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def catalog_entries(catalog):
+    """Return command and MCP entries while accepting older catalog files."""
+    return list(catalog.get("tools", [])) + list(catalog.get("mcp_servers", []))
+
+
+def find_catalog_entry(catalog, name):
+    kind = "mcp" if name.startswith("mcp:") else None
+    target = name[4:] if kind else name
+    return next(
+        (
+            entry
+            for entry in catalog_entries(catalog)
+            if entry["name"] == target and (kind is None or entry.get("kind") == kind)
+        ),
+        None,
+    )
+
+
+def entry_display_name(entry):
+    return f"mcp:{entry['name']}" if entry.get("kind") == "mcp" else entry["name"]
 
 
 def credentials_path():
@@ -460,7 +629,7 @@ def jev_rerank(query, entries, timeout=8, settings=None):
             "questions": {
                 "relevant": {
                     "type": "noul",
-                    "instructions": "Does this installed command help complete the user's request?",
+                    "instructions": "Does this available tool help complete the user's request?",
                     "criteria": {
                         "true": "The command directly supports the requested task or is a strong practical match.",
                         "false": "The command is unrelated, too general, or only shares a broad word.",
@@ -493,7 +662,7 @@ def jev_rerank(query, entries, timeout=8, settings=None):
 def search(catalog, query, limit):
     terms = expanded_terms(query)
     ranked = []
-    for entry in catalog["tools"]:
+    for entry in catalog_entries(catalog):
         name_terms = tokens(entry["name"])
         description_terms = tokens(entry["description"])
         document_terms = tokens(" ".join(d["text"] for d in entry["documents"]))
@@ -502,13 +671,34 @@ def search(catalog, query, limit):
             continue
         score = 10 * len(terms & name_terms) + 4 * len(terms & description_terms)
         score += len(matched) + 2 * len(terms & tokens(entry.get("help", "")))
-        score += 20 * (entry["name"].lower() == query.lower())
+        score += 20 * (entry["name"].lower() == query.strip().lower())
         score += 10 * bool(tokens(query) <= matched)
         score += 3 * bool(entry["documents"])
-        if Path(entry["path"]).is_file() and os.access(entry["path"], os.X_OK):
+        available = (
+            Path(entry["path"]).is_file()
+            if entry.get("kind") == "mcp"
+            else Path(entry["path"]).is_file() and os.access(entry["path"], os.X_OK)
+        )
+        if available:
             ranked.append((score, entry))
     ranked.sort(key=lambda pair: (-pair[0], pair[1]["name"]))
     return [entry for _, entry in ranked[:limit]]
+
+
+def prioritize_exact(query, entries):
+    """Keep exact MCP server names ahead of semantic matches."""
+    target = query.strip().lower()
+    return sorted(
+        enumerate(entries),
+        key=lambda item: (
+            not (
+                item[1].get("kind") == "mcp"
+                and item[1]["name"].lower() == target
+            ),
+            not (item[1]["name"].lower() == target),
+            item[0],
+        ),
+    )
 
 
 def print_search_results(entries, jev_message=""):
@@ -517,7 +707,7 @@ def print_search_results(entries, jev_message=""):
         return
     width = min(shutil.get_terminal_size((100, 24)).columns, 120)
     scored = any("jev_score" in entry for entry in entries)
-    name_width = max(7, max(len(entry["name"]) for entry in entries))
+    name_width = max(7, max(len(entry_display_name(entry)) for entry in entries))
     score_width = 7 if scored else 0
     description_width = width - name_width - score_width - 2
     compact = description_width < 25
@@ -528,7 +718,7 @@ def print_search_results(entries, jev_message=""):
         score_header = "  SCORE" if scored else ""
         print(f"{'COMMAND':<{name_width}}{score_header}  DESCRIPTION")
     for entry in entries:
-        name = entry["name"]
+        name = entry_display_name(entry)
         description = clean(entry["description"])
         description = re.sub(r"^" + re.escape(name) + r"\s+[—–-]\s+", "", description)
         score = (
@@ -552,6 +742,76 @@ def print_search_results(entries, jev_message=""):
     if jev_message and not scored:
         print(f"\n{jev_message}")
     print("\nDetails: tool-catalog show <command>")
+
+
+def catalog_status(catalog, state):
+    return {
+        "commands": len(catalog["tools"]),
+        "described": sum(bool(t["documents"]) for t in catalog["tools"]),
+        "mcp_servers": len(catalog.get("mcp_servers", [])),
+        "age_seconds": round(time.time() - catalog["updated_at"]),
+        "catalog": str(state / "catalog.json"),
+        "warnings": catalog["warnings"],
+    }
+
+
+def search_catalog(args, catalog, config):
+    jev_config = config.get("jev", {})
+    use_jev = args.jev if args.jev is not None else bool(jev_config.get("enabled", False))
+    requested_limit = max(1, args.limit)
+    search_limit = requested_limit
+    if use_jev:
+        try:
+            configured_limit = int(jev_config.get("candidate_limit", max(requested_limit, 12)))
+        except (TypeError, ValueError):
+            configured_limit = max(requested_limit, 12)
+        search_limit = max(requested_limit, min(configured_limit, 50))
+    query = " ".join(args.query)
+    output = search(catalog, query, search_limit)
+    if use_jev and output:
+        output, message = jev_rerank(
+            query, output, timeout=float(jev_config.get("timeout", 8)), settings=jev_config
+        )
+        output = [entry for _, entry in prioritize_exact(query, output)]
+        return output[:requested_limit], message
+    return output, ""
+
+
+def command_output(args, catalog, config, state, parser):
+    if args.command in ("refresh", "status"):
+        return catalog_status(catalog, state)
+    if args.command == "list":
+        output = sorted(catalog_entries(catalog), key=lambda entry: entry["name"])
+        if not args.json:
+            for entry in output:
+                suffix = " [mcp]" if entry.get("kind") == "mcp" else ""
+                print(entry_display_name(entry) + suffix)
+            return None
+        return output
+    if args.command in ("show", "inspect"):
+        if args.command == "show":
+            output = find_catalog_entry(catalog, args.name)
+        else:
+            output = inspect_tool(catalog, args.name, state, args.refresh, args.cwd)
+        if output is None:
+            parser.exit(1, f"Tool not found in catalog: {args.name}\n")
+        if args.command == "inspect" and not args.json:
+            print(f"{output['name']} — {output['description'][:240]}")
+            if output.get("kind") == "mcp":
+                print(f"  config: {output['path']}")
+                print(f"  clients: {', '.join(output['mcp']['clients'])}")
+                print(f"  transport: {', '.join(output['mcp']['transports'])}")
+            else:
+                print(f"  path: {output['path']}")
+                print(f"  help flag: {output.get('help_flag', 'cached')}")
+                print("\n" + (output.get("help") or "No help output captured."))
+            return None
+        return output
+    output, message = search_catalog(args, catalog, config)
+    if not args.json:
+        print_search_results(output, message)
+        return None
+    return output
 
 
 def main():
@@ -603,67 +863,9 @@ def main():
             if args.command == "refresh"
             else load_catalog(args.state_dir)
         )
-        if args.command in ("refresh", "status"):
-            output = {
-                "commands": len(catalog["tools"]),
-                "described": sum(bool(t["documents"]) for t in catalog["tools"]),
-                "age_seconds": round(time.time() - catalog["updated_at"]),
-                "catalog": str(args.state_dir / "catalog.json"),
-                "warnings": catalog["warnings"],
-            }
-        elif args.command == "list":
-            output = sorted(catalog["tools"], key=lambda entry: entry["name"])
-            if not args.json:
-                for entry in output:
-                    print(entry["name"])
-                return
-        elif args.command == "show":
-            output = next((t for t in catalog["tools"] if t["name"] == args.name), None)
-            if output is None:
-                parser.exit(1, f"Command not found in catalog: {args.name}\n")
-        elif args.command == "inspect":
-            output = inspect_tool(
-                catalog, args.name, args.state_dir, args.refresh, args.cwd
-            )
-            if output is None:
-                parser.exit(1, f"Command not found in catalog: {args.name}\n")
-            if not args.json:
-                print(f"{output['name']} — {output['description'][:240]}")
-                print(f"  path: {output['path']}")
-                print(f"  help flag: {output.get('help_flag', 'cached')}")
-                print("\n" + (output.get("help") or "No help output captured."))
-                return
-        else:
-            jev_message = ""
-            jev_config = config.get("jev", {})
-            use_jev = (
-                args.jev
-                if args.jev is not None
-                else bool(jev_config.get("enabled", False))
-            )
-            requested_limit = max(1, args.limit)
-            search_limit = requested_limit
-            if use_jev:
-                try:
-                    configured_limit = int(
-                        jev_config.get("candidate_limit", max(requested_limit, 12))
-                    )
-                except (TypeError, ValueError):
-                    configured_limit = max(requested_limit, 12)
-                search_limit = max(requested_limit, min(configured_limit, 50))
-            output = search(catalog, " ".join(args.query), search_limit)
-            if use_jev and output:
-                output, jev_message = jev_rerank(
-                    " ".join(args.query),
-                    output,
-                    timeout=float(jev_config.get("timeout", 8)),
-                    settings=jev_config,
-                )
-                output = output[:requested_limit]
-            if not args.json:
-                print_search_results(output, jev_message)
-                return
-        print(json.dumps(output, indent=2))
+        output = command_output(args, catalog, config, args.state_dir, parser)
+        if output is not None:
+            print(json.dumps(output, indent=2))
     except (OSError, ValueError, KeyError) as error:
         parser.exit(1, f"Catalog error: {error}\n")
 

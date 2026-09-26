@@ -102,6 +102,112 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0][1], "Query private metrics. Inspect dashboards.")
 
+    def test_mcp_metadata_reads_client_configs_without_secret_values(self):
+        path = self.root / ".cursor/mcp.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "linear": {
+                            "command": "npx",
+                            "args": ["-y", "mcp-remote", "https://mcp.linear.app/mcp"],
+                            "env": {"LINEAR_TOKEN": "secret-value"},
+                        },
+                        "sm": {"url": "https://mcp.sawmills.ai/mcp"},
+                    }
+                }
+            )
+        )
+        warnings = []
+        entries = catalog.mcp_metadata([path], warnings)
+        self.assertEqual([entry["name"] for entry in entries], ["linear", "sm"])
+        self.assertEqual(entries[0]["kind"], "mcp")
+        self.assertEqual(entries[0]["mcp"]["clients"], ["cursor"])
+        self.assertEqual(entries[0]["mcp"]["transports"], ["stdio"])
+        self.assertNotIn("secret-value", json.dumps(entries))
+        self.assertEqual(warnings, [])
+
+    def test_mcp_metadata_drops_arguments_from_string_commands(self):
+        path = self.root / ".cursor/mcp.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {"mcpServers": {"private": {"command": "npx --token secret-value"}}}
+            )
+        )
+        entry = catalog.mcp_metadata([path], [])[0]
+        self.assertEqual(entry["mcp"]["commands"], ["npx"])
+        self.assertNotIn("secret-value", json.dumps(entry))
+
+    def test_mcp_metadata_reads_large_json_configs(self):
+        path = self.root / ".claude.json"
+        path.write_text(
+            json.dumps(
+                {"padding": "x" * 140_000, "mcpServers": {"linear": {"url": "https://example.test"}}}
+            )
+        )
+        entries = catalog.mcp_metadata([path], [])
+        self.assertEqual([entry["name"] for entry in entries], ["linear"])
+
+    def test_mcp_metadata_ignores_blank_command_values(self):
+        path = self.root / ".cursor/mcp.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"mcpServers": {"blank": {"command": "   "}}}))
+        entries = catalog.mcp_metadata([path], [])
+        self.assertEqual(entries[0]["mcp"]["commands"], [])
+
+    def test_mcp_metadata_skips_invalid_config_paths(self):
+        warnings = []
+        self.assertEqual(catalog.mcp_metadata([None, {}], warnings), [])
+        self.assertEqual(len(warnings), 2)
+
+    def test_mcp_selector_resolves_name_collisions(self):
+        command_path = self.executable("bin/linear")
+        mcp_path = self.root / ".cursor/mcp.json"
+        mcp_path.parent.mkdir(parents=True)
+        mcp_path.write_text(json.dumps({"mcpServers": {"linear": {"url": "https://example.test"}}}))
+        data = {
+            "tools": [{"name": "linear", "path": str(command_path)}],
+            "mcp_servers": catalog.mcp_metadata([mcp_path], []),
+        }
+        self.assertIsNone(catalog.find_catalog_entry(data, "linear").get("kind"))
+        self.assertEqual(catalog.find_catalog_entry(data, "mcp:linear")["kind"], "mcp")
+
+    def test_mcp_metadata_reads_codex_toml_and_project_scopes(self):
+        path = self.root / ".codex/config.toml"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            """
+[mcp_servers.linear]
+command = "npx"
+
+[mcp_servers.linear.tools.save_comment]
+enabled = true
+"""
+        )
+        entries = catalog.mcp_metadata([path], [])
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["name"], "linear")
+        self.assertEqual(entries[0]["mcp"]["clients"], ["codex"])
+        self.assertEqual(entries[0]["mcp"]["transports"], ["stdio"])
+
+    def test_search_includes_configured_mcp_servers(self):
+        path = self.root / ".cursor/mcp.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"mcpServers": {"metrics": {"url": "https://example.test"}}}))
+        entry = catalog.mcp_metadata([path], [])[0]
+        result = catalog.search({"tools": [], "mcp_servers": [entry]}, "metrics", 1)
+        self.assertEqual(result[0]["name"], "metrics")
+
+    def test_prioritize_exact_mcp_name_after_semantic_ranking(self):
+        entries = [
+            {"name": "train", "description": "Linear classifier", "jev_score": 0.9},
+            {"name": "linear", "kind": "mcp", "description": "MCP server", "jev_score": 0.4},
+        ]
+        result = catalog.prioritize_exact("linear ", entries)
+        self.assertEqual([entry["name"] for _, entry in result], ["linear", "train"])
+
     def test_manual_name_section_and_mdoc(self):
         path = self.root / "custom.1"
         path.write_text(
