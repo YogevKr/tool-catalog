@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 .ripwire*/
+.env
+.env.*
+!.env.example
+credentials.json
+catalog.json
+refresh.log
+refresh-error.log

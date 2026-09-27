@@ -48,6 +48,7 @@ Use `show NAME` for full descriptions and executable paths, or `--json` for stru
 
 `list` prints all indexed command and MCP server names alphabetically, one per line.
 MCP servers use the `mcp:NAME` selector and have a `[mcp]` suffix.
+Aliases and functions use `alias:NAME` and have an `[alias]` suffix.
 `list --json` returns full entries, including paths, descriptions, and sources.
 Both use the same cache and automatic refresh as search.
 
@@ -84,6 +85,56 @@ It stores the result in the catalog. Use `--refresh` to capture it again.
 Use `--cwd` when the command needs a project directory. The current directory is
 the default. Help is recaptured when the directory changes.
 
+## Shell aliases and functions
+
+Add an `aliases` list to the existing `~/.local/share/tool-catalog/config.json`.
+Keep the other configuration fields. For example:
+
+```json
+{
+  "aliases": [
+    {
+      "name": "co",
+      "description": "Preferred launcher for Codex.",
+      "shell": "zsh",
+      "source": "~/.zshrc",
+      "command": "codex",
+      "preferred_for": ["codex"]
+    }
+  ]
+}
+```
+
+Each entry requires a name and description. The shell, source, and command fields are optional text.
+The command field documents the expansion. The catalog does not execute it.
+Use the same format for shell functions. Do not store secrets or function bodies in these fields.
+Names are case-sensitive. Duplicate names keep the first valid entry and produce a warning.
+Invalid entries produce warnings in `status` without removing valid entries.
+
+```sh
+tool-catalog refresh
+tool-catalog search "codex" --no-jev
+tool-catalog show alias:co
+tool-catalog inspect alias:co
+```
+
+Descriptions make aliases searchable by capability. State the preferred use in the description.
+Use `preferred_for` to list commands that this alias should replace in search results.
+Preferred aliases rank first for exact command-name searches, including searches with Jev.
+Other searches use the existing ranking rules. Registration does not force agents to execute an alias.
+Names such as `alias:co` identify catalog entries. Invoke the shell name `co`.
+Bare-name lookup selects an executable first when names conflict. Use `alias:NAME` to select the alias explicitly.
+
+`inspect` displays alias metadata without running help commands or loading shell files.
+Alias availability remains unverified. Check `type co` in the indicated shell before execution.
+An agent's shell can lack aliases that your interactive shell loads.
+Use a shell with the required definitions when you invoke an alias or function.
+
+Refresh reads these explicit descriptions. It does not parse shell files or start an interactive shell.
+This keeps descriptions stable and prevents shell startup actions during scheduled refresh.
+Remove an entry from the configuration and refresh to remove it from the catalog.
+Jev receives alias names and descriptions when alias entries reach its shortlist.
+
 ## Sources and refresh
 
 Refresh scans the configured command directories and MCP client configs.
@@ -102,8 +153,8 @@ command arguments, URLs, environment values, or other server settings.
 
 Refresh never executes discovered commands. It runs the existing Homebrew CLI
 with automatic updates disabled. Commands without documentation remain searchable
-by name. Aliases, shell functions, and arbitrary executables outside configured
-directories are outside this trial.
+by name. Configure aliases and shell functions in the `aliases` list.
+Executables outside configured directories remain outside discovery.
 
 `~/.local/share/tool-catalog/config.json` contains the captured PATH, extra paths,
 manual directories, skill directories, and MCP config paths. Refresh detects
@@ -112,7 +163,8 @@ there if an installer introduces a new command or MCP config directory.
 No list of individual tools is required.
 
 `catalog.json` stores command results in `tools` and MCP results in
-`mcp_servers`. Refresh writes it atomically.
+`mcp_servers`. The `aliases` array stores configured aliases and functions.
+Refresh writes the catalog atomically.
 `status` reports missing descriptions and source errors. Refresh logs use
 `refresh.log` and `refresh-error.log` in the same directory.
 Search refreshes a missing cache or a cache older than one hour.

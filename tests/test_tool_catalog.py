@@ -162,6 +162,154 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(catalog.mcp_metadata([None, {}], warnings), [])
         self.assertEqual(len(warnings), 2)
 
+    def test_alias_metadata_builds_searchable_entries_without_execution(self):
+        warnings = []
+        entries = catalog.alias_metadata(
+            [
+                {
+                    "name": "co",
+                    "description": "Launch Codex from the current shell.",
+                    "shell": "zsh",
+                    "source": "~/.zshrc",
+                    "command": "codex",
+                }
+            ],
+            warnings,
+        )
+        self.assertEqual(warnings, [])
+        self.assertEqual(entries[0]["name"], "co")
+        self.assertEqual(entries[0]["kind"], "alias")
+        self.assertEqual(entries[0]["shell"], "zsh")
+        self.assertEqual(entries[0]["command"], "codex")
+        self.assertEqual(entries[0]["path"], "~/.zshrc")
+
+    def test_alias_metadata_warns_on_invalid_values_and_duplicates(self):
+        warnings = []
+        valid = {"name": "co", "description": "Launch Codex"}
+        entries = catalog.alias_metadata(
+            [valid, None, "co", {"name": "empty"},
+             {**valid, "name": "bad name"}, {**valid, "description": 3},
+             {**valid, "shell": []}, {**valid, "command": {}},
+             {**valid, "source": False}, valid],
+            warnings,
+        )
+        self.assertEqual([entry["name"] for entry in entries], ["co"])
+        self.assertEqual(len(warnings), 9)
+        for value in (None, {}, "co"):
+            warnings = []
+            self.assertEqual(catalog.alias_metadata(value, warnings), [])
+            self.assertEqual(warnings, ["Aliases must be a list"])
+
+    def test_refresh_indexes_aliases_and_searches_them(self):
+        state = self.root / "state"
+        config = {
+            "paths": [],
+            "extra_paths": [],
+            "skill_roots": [],
+            "man_roots": [],
+            "mcp_configs": [],
+            "aliases": [
+                {
+                    "name": "co",
+                    "description": "Launch Codex in the current repository.",
+                }
+            ],
+        }
+        catalog.write_json(state / "config.json", config)
+        with mock.patch.object(catalog, "brew_metadata", return_value={}):
+            result = catalog.refresh(state)
+        self.assertEqual([entry["name"] for entry in result["aliases"]], ["co"])
+        self.assertEqual(catalog.search(result, "codex", 1)[0]["name"], "co")
+        self.assertEqual(catalog.find_catalog_entry(result, "alias:co")["kind"], "alias")
+        with mock.patch.object(catalog, "capture_help") as capture:
+            self.assertEqual(catalog.inspect_tool(result, "co", state, force=True)["kind"], "alias")
+        capture.assert_not_called()
+        config["aliases"] = []
+        catalog.write_json(state / "config.json", config)
+        with mock.patch.object(catalog, "brew_metadata", return_value={}):
+            self.assertEqual(catalog.refresh(state)["aliases"], [])
+
+    def test_alias_selector_resolves_collisions_and_preserves_case(self):
+        data = {
+            "tools": [{"name": "co"}],
+            "mcp_servers": [{"name": "co", "kind": "mcp"}],
+            "aliases": catalog.alias_metadata([
+                {"name": "co", "description": "Launch Codex"},
+                {"name": "CO", "description": "Another function"},
+            ], []),
+        }
+        self.assertNotIn("kind", catalog.find_catalog_entry(data, "co"))
+        self.assertEqual(catalog.find_catalog_entry(data, "mcp:co")["kind"], "mcp")
+        self.assertEqual(catalog.find_catalog_entry(data, "alias:co")["name"], "co")
+        self.assertEqual(catalog.find_catalog_entry(data, "alias:CO")["name"], "CO")
+        self.assertIsNone(catalog.find_catalog_entry(data, "alias:missing"))
+
+    def test_alias_cli_output_identifies_the_invocation(self):
+        state = self.root / "state"
+        entry = catalog.alias_metadata([{
+            "name": "co", "description": "Preferred Codex launcher",
+            "shell": "zsh", "command": "codex",
+        }], [])[0]
+        catalog.write_json(state / "catalog.json", {"tools": [], "aliases": [entry]})
+        for arguments, expected in [
+            (["list"], "alias:co [alias]"),
+            (["search", "codex", "--no-jev"], "alias:co"),
+            (["inspect", "alias:co"], "invocation: co"),
+            (["inspect", "alias:co", "--json"], '"kind": "alias"'),
+            (["show", "alias:co"], '"availability": "unverified"'),
+        ]:
+            output = io.StringIO()
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch("sys.argv", ["tool-catalog", "--state-dir", str(state), *arguments]),
+                mock.patch("sys.stdout", output),
+                mock.patch.object(catalog.subprocess, "run") as run,
+            ):
+                catalog.main()
+                self.assertIn(expected, output.getvalue())
+                run.assert_not_called()
+
+    def test_jev_keeps_exact_alias_selector_first(self):
+        entries = [
+            {"name": "other", "jev_score": 0.9},
+            {"name": "co", "kind": "alias", "jev_score": 0.2},
+        ]
+        result = catalog.prioritize_exact("alias:co", entries)
+        self.assertEqual(result[0][1]["name"], "co")
+
+    def test_preferred_alias_survives_shortlist_and_jev_ranking(self):
+        path = self.executable("bin/codex")
+        commands = [
+            {"name": f"codex-{index}", "path": str(path),
+             "description": "Codex", "documents": []}
+            for index in range(20)
+        ]
+        commands[0]["name"] = "codex"
+        aliases = catalog.alias_metadata([{
+            "name": "co", "description": "Launch the preferred coding agent",
+            "preferred_for": ["codex"],
+        }], [])
+        data = {"tools": commands, "aliases": aliases}
+        self.assertEqual(catalog.search(data, "codex", 1), aliases)
+        args = catalog.argparse.Namespace(jev=True, limit=1, query=["codex"])
+        with mock.patch.object(
+            catalog, "jev_rerank",
+            side_effect=lambda query, entries, **kwargs: (list(reversed(entries)), "mock ranking"),
+        ) as rerank:
+            result, _ = catalog.search_catalog(args, data, {"jev": {"candidate_limit": 2}})
+        self.assertEqual(result, aliases)
+        self.assertEqual(len(rerank.call_args.args[1]), 2)
+        self.assertFalse(catalog.preferred_alias("codex history", aliases[0]))
+
+    def test_preferred_alias_rejects_invalid_targets(self):
+        for targets in ("codex", None, [False], ["  "]):
+            warnings = []
+            entries = catalog.alias_metadata([{
+                "name": "co", "description": "Codex", "preferred_for": targets,
+            }], warnings)
+            self.assertEqual(entries, [])
+            self.assertEqual(len(warnings), 1)
+
     def test_mcp_selector_resolves_name_collisions(self):
         command_path = self.executable("bin/linear")
         mcp_path = self.root / ".cursor/mcp.json"

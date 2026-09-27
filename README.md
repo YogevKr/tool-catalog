@@ -4,6 +4,7 @@ Discover installed command line tools for coding agents on macOS.
 
 The catalog scans local PATH directories, Homebrew metadata, manual pages,
 agent skill descriptions, MCP client configs, and cached command help.
+It also indexes configured shell aliases and functions with descriptions.
 It refreshes through launchd. Agents search it with short capability phrases.
 
 ```sh

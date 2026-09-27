@@ -275,6 +275,51 @@ def mcp_metadata(paths, warnings):
     return sorted(entries.values(), key=lambda entry: entry["name"])
 
 
+def alias_metadata(values, warnings):
+    """Build searchable entries for user-defined shell aliases and functions."""
+    if not isinstance(values, list):
+        warnings.append("Aliases must be a list")
+        return []
+    entries = {}
+    for index, value in enumerate(values):
+        fields = ("name", "description", "shell", "source", "command")
+        if not isinstance(value, dict) or any(
+            not isinstance(value.get(field, ""), str) for field in fields
+        ):
+            warnings.append(f"Skipping alias at index {index}: fields must be strings")
+            continue
+        name = value.get("name", "")
+        description = clean(value.get("description", ""))
+        preferred_for = value.get("preferred_for", [])
+        if not isinstance(preferred_for, list) or any(
+            not isinstance(command, str) or not command.strip()
+            for command in preferred_for
+        ):
+            warnings.append(f"Skipping alias at index {index}: preferred_for must contain command names")
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_.+-]+", name) or not description:
+            warnings.append(f"Skipping alias at index {index}: name and description are required")
+            continue
+        if name in entries:
+            warnings.append(f"Skipping duplicate alias {name}")
+            continue
+        source = value.get("source") or "config:aliases"
+        entry = {
+            "name": name,
+            "kind": "alias",
+            "path": source,
+            "resolved_path": "",
+            "other_paths": [],
+            "description": description,
+            "documents": [{"text": description, "source": source}],
+            "availability": "unverified",
+            "preferred_for": [command.strip() for command in preferred_for],
+        }
+        entry.update({field: value[field] for field in ("shell", "command") if value.get(field)})
+        entries[name] = entry
+    return sorted(entries.values(), key=lambda entry: entry["name"])
+
+
 def manual_description(path):
     text = read_text(path)
     nd = re.search(r"(?m)^\.Nd\s+(.+)", text)
@@ -406,7 +451,7 @@ def inspect_tool(catalog, name, state, force=False, cwd=None):
     entry = find_catalog_entry(catalog, name)
     if entry is None:
         return None
-    if entry.get("kind") == "mcp":
+    if entry.get("kind") in ("mcp", "alias"):
         return entry
     help_cwd = str(cwd or Path.cwd())
     if force or not entry.get("help") or entry.get("help_cwd") != help_cwd:
@@ -447,6 +492,7 @@ def default_config():
             str(home / ".codex/config.toml"),
             str(home / ".config/opencode/opencode.json"),
         ],
+        "aliases": [],
     }
 
 
@@ -469,11 +515,13 @@ def refresh(state):
     mcp_servers = mcp_metadata(
         config.get("mcp_configs", default_config()["mcp_configs"]), warnings
     )
+    aliases = alias_metadata(config.get("aliases", []), warnings)
     catalog = {
-        "version": 2,
+        "version": 3,
         "updated_at": time.time(),
         "tools": entries,
         "mcp_servers": mcp_servers,
+        "aliases": aliases,
         "warnings": warnings,
     }
     write_json(state / "catalog.json", catalog)
@@ -501,13 +549,22 @@ def load_config(state):
 
 
 def catalog_entries(catalog):
-    """Return command and MCP entries while accepting older catalog files."""
-    return list(catalog.get("tools", [])) + list(catalog.get("mcp_servers", []))
+    """Return all entries while accepting older catalog files."""
+    return (
+        list(catalog.get("tools", []))
+        + list(catalog.get("mcp_servers", []))
+        + list(catalog.get("aliases", []))
+    )
 
 
 def find_catalog_entry(catalog, name):
-    kind = "mcp" if name.startswith("mcp:") else None
-    target = name[4:] if kind else name
+    kind = None
+    target = name
+    for prefix, candidate in (("mcp:", "mcp"), ("alias:", "alias")):
+        if name.startswith(prefix):
+            kind = candidate
+            target = name[len(prefix) :]
+            break
     return next(
         (
             entry
@@ -519,7 +576,8 @@ def find_catalog_entry(catalog, name):
 
 
 def entry_display_name(entry):
-    return f"mcp:{entry['name']}" if entry.get("kind") == "mcp" else entry["name"]
+    kind = entry.get("kind")
+    return f"{kind}:{entry['name']}" if kind in ("mcp", "alias") else entry["name"]
 
 
 def credentials_path():
@@ -666,23 +724,38 @@ def search(catalog, query, limit):
         name_terms = tokens(entry["name"])
         description_terms = tokens(entry["description"])
         document_terms = tokens(" ".join(d["text"] for d in entry["documents"]))
-        matched = terms & (name_terms | description_terms | document_terms)
+        preferred_terms = tokens(" ".join(entry.get("preferred_for", [])))
+        matched = terms & (name_terms | description_terms | document_terms | preferred_terms)
         if not matched:
             continue
         score = 10 * len(terms & name_terms) + 4 * len(terms & description_terms)
         score += len(matched) + 2 * len(terms & tokens(entry.get("help", "")))
-        score += 20 * (entry["name"].lower() == query.strip().lower())
+        score += 20 * (query.strip().lower() in (
+            entry["name"].lower(), entry_display_name(entry).lower()
+        ))
         score += 10 * bool(tokens(query) <= matched)
         score += 3 * bool(entry["documents"])
-        available = (
-            Path(entry["path"]).is_file()
-            if entry.get("kind") == "mcp"
-            else Path(entry["path"]).is_file() and os.access(entry["path"], os.X_OK)
-        )
+        if entry.get("kind") == "alias":
+            available = True
+        elif entry.get("kind") == "mcp":
+            available = Path(entry["path"]).is_file()
+        else:
+            available = Path(entry["path"]).is_file() and os.access(
+                entry["path"], os.X_OK
+            )
         if available:
             ranked.append((score, entry))
-    ranked.sort(key=lambda pair: (-pair[0], pair[1]["name"]))
+    ranked.sort(key=lambda pair: (
+        not preferred_alias(query, pair[1]), -pair[0], pair[1]["name"]
+    ))
     return [entry for _, entry in ranked[:limit]]
+
+
+def preferred_alias(query, entry):
+    """Honor explicit alias preferences for exact command-name searches."""
+    return entry.get("kind") == "alias" and query.strip().lower() in (
+        command.lower() for command in entry.get("preferred_for", [])
+    )
 
 
 def prioritize_exact(query, entries):
@@ -691,11 +764,14 @@ def prioritize_exact(query, entries):
     return sorted(
         enumerate(entries),
         key=lambda item: (
+            not preferred_alias(query, item[1]),
             not (
                 item[1].get("kind") == "mcp"
                 and item[1]["name"].lower() == target
             ),
-            not (item[1]["name"].lower() == target),
+            target not in (
+                item[1]["name"].lower(), entry_display_name(item[1]).lower()
+            ),
             item[0],
         ),
     )
@@ -741,7 +817,7 @@ def print_search_results(entries, jev_message=""):
             print(f"{name:<{name_width}}{score}  {summary}")
     if jev_message and not scored:
         print(f"\n{jev_message}")
-    print("\nDetails: tool-catalog show <command>")
+    print("\nDetails: tool-catalog show <name>")
 
 
 def catalog_status(catalog, state):
@@ -749,6 +825,7 @@ def catalog_status(catalog, state):
         "commands": len(catalog["tools"]),
         "described": sum(bool(t["documents"]) for t in catalog["tools"]),
         "mcp_servers": len(catalog.get("mcp_servers", [])),
+        "aliases": len(catalog.get("aliases", [])),
         "age_seconds": round(time.time() - catalog["updated_at"]),
         "catalog": str(state / "catalog.json"),
         "warnings": catalog["warnings"],
@@ -777,6 +854,18 @@ def search_catalog(args, catalog, config):
     return output, ""
 
 
+def print_alias_details(entry):
+    """Show invocation metadata without running a shell or the alias."""
+    print("  type: shell alias or function")
+    print(f"  invocation: {entry['name']}")
+    for field, label in (("shell", "shell"), ("command", "expansion"), ("path", "source")):
+        if entry.get(field):
+            print(f"  {label}: {entry[field]}")
+    if entry.get("preferred_for"):
+        print(f"  preferred for: {', '.join(entry['preferred_for'])}")
+    print("  availability: unverified; check type NAME in the indicated shell")
+
+
 def command_output(args, catalog, config, state, parser):
     if args.command in ("refresh", "status"):
         return catalog_status(catalog, state)
@@ -784,7 +873,7 @@ def command_output(args, catalog, config, state, parser):
         output = sorted(catalog_entries(catalog), key=lambda entry: entry["name"])
         if not args.json:
             for entry in output:
-                suffix = " [mcp]" if entry.get("kind") == "mcp" else ""
+                suffix = {"mcp": " [mcp]", "alias": " [alias]"}.get(entry.get("kind"), "")
                 print(entry_display_name(entry) + suffix)
             return None
         return output
@@ -801,6 +890,8 @@ def command_output(args, catalog, config, state, parser):
                 print(f"  config: {output['path']}")
                 print(f"  clients: {', '.join(output['mcp']['clients'])}")
                 print(f"  transport: {', '.join(output['mcp']['transports'])}")
+            elif output.get("kind") == "alias":
+                print_alias_details(output)
             else:
                 print(f"  path: {output['path']}")
                 print(f"  help flag: {output.get('help_flag', 'cached')}")
